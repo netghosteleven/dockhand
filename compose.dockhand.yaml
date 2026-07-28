@@ -1,0 +1,143 @@
+name: honcho
+
+x-honcho-environment: &honcho-environment
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+  PERFORMANCE_LOG_FORMAT: "${PERFORMANCE_LOG_FORMAT:-compact}"
+  AUTH_USE_AUTH: "${AUTH_USE_AUTH:-true}"
+  AUTH_JWT_SECRET: "${AUTH_JWT_SECRET:?Set AUTH_JWT_SECRET in Dockhand or .env}"
+  LLM_OPENAI_API_KEY: "${LLM_OPENAI_API_KEY:?Set LLM_OPENAI_API_KEY in Dockhand or .env}"
+  EMBED_MESSAGES: "${EMBED_MESSAGES:-false}"
+  EMBEDDING_VECTOR_DIMENSIONS: "${EMBEDDING_VECTOR_DIMENSIONS:-1536}"
+  EMBEDDING_MODEL_CONFIG__TRANSPORT: "${EMBEDDING_MODEL_CONFIG__TRANSPORT:-openai}"
+  EMBEDDING_MODEL_CONFIG__MODEL: "${EMBEDDING_MODEL_CONFIG__MODEL:-text-embedding-3-small}"
+  DERIVER_ENABLED: "${DERIVER_ENABLED:-true}"
+  DERIVER_WORKERS: "${DERIVER_WORKERS:-1}"
+  DERIVER_MODEL_CONFIG__TRANSPORT: "${DERIVER_MODEL_CONFIG__TRANSPORT:-openai}"
+  DERIVER_MODEL_CONFIG__MODEL: "${DERIVER_MODEL_CONFIG__MODEL:-gpt-5.4-mini}"
+  DERIVER_MODEL_CONFIG__THINKING_EFFORT: "${DERIVER_MODEL_CONFIG__THINKING_EFFORT:-minimal}"
+  DERIVER_REPRESENTATION_BATCH_WORK_UNIT_TARGET_TOKENS: "${DERIVER_REPRESENTATION_BATCH_WORK_UNIT_TARGET_TOKENS:-1024}"
+  DERIVER_REPRESENTATION_BATCH_TARGET_INPUT_TOKENS: "${DERIVER_REPRESENTATION_BATCH_TARGET_INPUT_TOKENS:-2048}"
+  DERIVER_REPRESENTATION_BATCH_MAX_AGE_SECONDS: "${DERIVER_REPRESENTATION_BATCH_MAX_AGE_SECONDS:-1800}"
+  DERIVER_FLUSH_ENABLED: "${DERIVER_FLUSH_ENABLED:-false}"
+  PEER_CARD_ENABLED: "${PEER_CARD_ENABLED:-true}"
+  SUMMARY_ENABLED: "${SUMMARY_ENABLED:-false}"
+  DREAM_ENABLED: "${DREAM_ENABLED:-false}"
+  DIALECTIC_MAX_OUTPUT_TOKENS: "${DIALECTIC_MAX_OUTPUT_TOKENS:-512}"
+  DIALECTIC_MAX_INPUT_TOKENS: "${DIALECTIC_MAX_INPUT_TOKENS:-25000}"
+  DIALECTIC_HISTORY_TOKEN_LIMIT: "${DIALECTIC_HISTORY_TOKEN_LIMIT:-4096}"
+  DIALECTIC_SESSION_HISTORY_MAX_TOKENS: "${DIALECTIC_SESSION_HISTORY_MAX_TOKENS:-2048}"
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__TRANSPORT: "${DIALECTIC_LEVELS__minimal__MODEL_CONFIG__TRANSPORT:-openai}"
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__MODEL: "${DIALECTIC_LEVELS__minimal__MODEL_CONFIG__MODEL:-gpt-5.4-mini}"
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__THINKING_EFFORT: "${DIALECTIC_LEVELS__minimal__MODEL_CONFIG__THINKING_EFFORT:-minimal}"
+  DIALECTIC_LEVELS__minimal__MAX_TOOL_ITERATIONS: "${DIALECTIC_LEVELS__minimal__MAX_TOOL_ITERATIONS:-1}"
+  DIALECTIC_LEVELS__minimal__MAX_OUTPUT_TOKENS: "${DIALECTIC_LEVELS__minimal__MAX_OUTPUT_TOKENS:-250}"
+  CACHE_ENABLED: "true"
+  CACHE_URL: "redis://redis:6379/0?suppress=true"
+  CORS_ORIGINS: "${CORS_ORIGINS:-[]}"
+  TELEMETRY_ENABLED: "${TELEMETRY_ENABLED:-false}"
+  VECTOR_STORE_TYPE: "pgvector"
+  VECTOR_STORE_MIGRATED: "false"
+  DB_CONNECTION_URI: "postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dockhand or .env}@database:5432/${POSTGRES_DB:-postgres}"
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: honcho-self-hosted:${HONCHO_IMAGE_TAG:-local}
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    init: true
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "192.168.1.113:8000:8000"
+    environment:
+      <<: *honcho-environment
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - honcho-internal
+
+  deriver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: honcho-self-hosted:${HONCHO_IMAGE_TAG:-local}
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    init: true
+    depends_on:
+      api:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *honcho-environment
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - honcho-internal
+
+  database:
+    image: pgvector/pgvector:pg15
+    command: ["postgres", "-c", "max_connections=100"]
+    shm_size: 256mb
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-postgres}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dockhand or .env}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
+      - /srv/docker/dockhand/dockhand_data/stacks/homelab/honcho-self-hosted/postgressql:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - honcho-internal
+
+  redis:
+    image: redis:8.2
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - /srv/docker/dockhand/dockhand_data/stacks/homelab/honcho-self-hosted/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - honcho-internal
+
+networks:
+  honcho-internal:
+    name: honcho-internal
+    driver: bridge
